@@ -59,6 +59,7 @@ def simple_net_model(features, labels, mode):
 
 
     x = features[X_FEATURE]
+    x = x / 128 - 1
     labels = labels[0]
     input_shape = x.get_shape().as_list()
 
@@ -71,7 +72,7 @@ def simple_net_model(features, labels, mode):
 
 
     # Compute logits (1 per class) and compute loss.
-    logits = simple_net.build_ianntf_network(x)
+    logits, l1_groups = simple_net.build_ianntf_network(x)
 
     # Compute predictions.
     predicted_classes = tf.argmax(logits, 1)
@@ -86,23 +87,24 @@ def simple_net_model(features, labels, mode):
     penalty = tf.constant(0)
     ##TODO l1 and l1 should be managable in the tf.estiamtor.TrainSpec sub class (best would be even over tf.flags)
     l2_regularize = False
-    l1_regularize = False
+    l1_regularize = True
     l2_lambda = 0.01
-    l1_regularizer_scale = 0.8
+    l1_regularizer_scale = 0.005
 
+    xentropy = None
     with tf.name_scope('objective'):
-        xentropy = tf.reduce_mean(
-            tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=labels))
+        # xentropy = tf.reduce_mean(
+        #     tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=labels))
         ## TODO: Check if we want to reduce mean!!
-        # xentropy = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
+        xentropy = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
 
         if l1_regularize and l2_regularize:
             raise Exception("[FATAL] L1 Regularization AND L2 regularization is not possible")
         elif l1_regularize:
             weight_sets = []
-            for layer in layer_names:
+            for layer in l1_groups:
                 weight_sets.append(
-                    [v for v in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES) if layer + '/act_weight' in v.name])
+                    [v for v in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES) if layer in v.name and '/act_weight' in v.name])
 
             l1_regularizer = tf.contrib.layers.l1_regularizer(scale=l1_regularizer_scale,
                                                               scope="l1_regularization")
@@ -121,21 +123,42 @@ def simple_net_model(features, labels, mode):
         else:
             loss = xentropy
 
+
         # tf.summary.scalar('loss', loss)
         # tf.summary.scalar('xentropy', xentropy)
 
 
-    # Create training op.
-    if training:
-        optimizer = tf.train.AdagradOptimizer(learning_rate=0.01)
-        train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
-        return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
+    shape_labels = tf.shape(labels)
+    shape_predicted_classes = tf.shape(predicted_classes)
+    accuracy_train = tf.metrics.accuracy(
+        labels=labels, predictions=predicted_classes)
 
-    # Compute evaluation metrics.
     eval_metric_ops = {
         'accuracy': tf.metrics.accuracy(
             labels=labels, predictions=predicted_classes)
     }
+
+    # Create training op.
+    if training:
+        logging_hook = tf.train.LoggingTensorHook({"loss": loss,
+                                                   "xentropy": xentropy,
+                                                   "accuracy": accuracy_train[1],
+                                                   "l1_penalty": penalty,
+                                                   # "shape_labels" : labels[0],
+                                                   # "shape_predicted_classes": logits[2]
+                                                   },
+                                                  every_n_iter=100)
+
+        optimizer = tf.train.AdagradOptimizer(learning_rate=0.01)
+        train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+        return tf.estimator.EstimatorSpec(mode,
+                                          loss=loss,
+                                          train_op=train_op,
+                                          training_hooks=[logging_hook],
+                                          eval_metric_ops=eval_metric_ops)
+
+    # Compute evaluation metrics.
+
     return tf.estimator.EstimatorSpec(
         mode, loss=loss, eval_metric_ops=eval_metric_ops)
 
@@ -193,28 +216,7 @@ def main(unused_args):
 
     EVAL_INTERVAL = 300
 
-    # train_input_fn = tf.estimator.inputs.numpy_input_fn(
-    #     x={X_FEATURE: mnist.train.images},
-    #     y=mnist.train.labels.astype(np.int32),
-    #     batch_size=32,
-    #     num_epochs=None,
-    #     shuffle=True)
-    # train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn,
-    #                                     max_steps=1000)
-    #
-    # validation_input_fn = tf.estimator.inputs.numpy_input_fn(
-    #     x={X_FEATURE: mnist.test.images},
-    #     y=mnist.test.labels.astype(np.int32),
-    #     num_epochs=1,
-    #     shuffle=False)
-    # eval_spec = tf.estimator.EvalSpec(input_fn= validation_input_fn,
-    #                                   start_delay_secs = 60,
-    #                                   throttle_secs = EVAL_INTERVAL)
-    #
-    # tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
-
-
-    num_gpus = 0
+    num_gpus = 1
     use_distortion_for_training = False
     train_batch_size = 64
 
@@ -228,9 +230,9 @@ def main(unused_args):
 
 
     train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn,
-                                        max_steps=1000)
+                                        max_steps=25000)
 
-    eval_batch_size = 5000
+    eval_batch_size = 1500
     validation_input_fn = functools.partial(
         input_fn,
         FLAGS.data_dir,
